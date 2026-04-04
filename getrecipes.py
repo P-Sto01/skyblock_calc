@@ -4,7 +4,13 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 
-starttime=time.time()
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+if not os.path.isfile(os.path.join(script_dir,"recipes.json")):
+    open(os.path.join(script_dir,"recipes.json"),"x")
+    print("Created file recipes.json")
+
+starttime=round(time.time(),0)
 
 columns, rows = os.get_terminal_size()
 barlenght=columns/3
@@ -107,8 +113,7 @@ for f in futures:
     f.result()
 print()
 
-script_dir = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(script_dir,"recipes.json"),"w") as k:
     k.write(json.dumps(items))
 
-print(f"Done in {time.strftime("%M:%S", time.gmtime((time.time()-starttime)))}")
+print(f"Done in {time.strftime("%M:%S", time.gmtime((round(time.time(),0)-starttime)))}")
