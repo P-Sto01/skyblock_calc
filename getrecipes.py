@@ -107,27 +107,32 @@ for i in listing:
         x=i.removeprefix("items/").removesuffix(".json")
         names.append(x)
 
-x=0
-totalnames=len(names)
-print(f"Total names: {totalnames}")
-
-t = threading.Thread(target=update)
-t.start()
-
 def count(num,max):
-    global x
-    for (currentitem) in names[int((totalnames/max)*num) : int((totalnames/max)*(num+1))]:
-        x+=1
-        items[currentitem]=recipeget(currentitem)
+        global x
+        for (currentitem) in names[int((totalnames/max)*num) : int((totalnames/max)*(num+1))]:
+            x+=1
+            items[currentitem]=recipeget(currentitem)
 
-workers=100
-with ThreadPoolExecutor(max_workers=workers) as executor:
-    futures = [executor.submit(count, i, workers) for i in range(workers)]
-for f in futures:
-    f.result()
+while True:
+    try:
+        x=0
+        totalnames=len(names)
+        print(f"Total names: {totalnames}")
+
+        t = threading.Thread(target=update)
+        t.start()
+
+        workers=100
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(count, i, workers) for i in range(workers)]
+        for f in futures:
+            f.result()
+        break
+    except Exception as e:
+        print("Failed, retrying script...")
 
 done=True
-t.join
+t.join()
 renderbar(totalnames,totalnames,barlenght)
 print()
 
