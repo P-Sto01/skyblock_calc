@@ -3,6 +3,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 import os
 import time
+import threading
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -14,6 +15,8 @@ starttime=round(time.time(),0)
 
 columns, rows = os.get_terminal_size()
 barlenght=columns/3
+
+done=False
 
 items={}
 grid=["A1","A2","A3","B1","B2","B3","C1","C2","C3"]
@@ -81,6 +84,15 @@ def renderbar(num,total,lenght):
         bar+="."
     print(f"{bar} {procent}%",end="\r")
 
+def update():
+    while not done:
+        global x
+        global totalnames
+        global barlenght
+        renderbar(x,totalnames,barlenght)
+        time.sleep(1)
+
+
 listing=[]
 names=[]
 
@@ -95,22 +107,28 @@ for i in listing:
         x=i.removeprefix("items/").removesuffix(".json")
         names.append(x)
 
+x=0
 totalnames=len(names)
 print(f"Total names: {totalnames}")
 
-x=0
+t = threading.Thread(target=update)
+t.start()
+
 def count(num,max):
     global x
     for (currentitem) in names[int((totalnames/max)*num) : int((totalnames/max)*(num+1))]:
         x+=1
         items[currentitem]=recipeget(currentitem)
-        renderbar(x,totalnames,barlenght)
 
 workers=100
 with ThreadPoolExecutor(max_workers=workers) as executor:
     futures = [executor.submit(count, i, workers) for i in range(workers)]
 for f in futures:
     f.result()
+
+done=True
+t.join
+renderbar(totalnames,totalnames,barlenght)
 print()
 
 with open(os.path.join(script_dir,"recipes.json"),"w") as k:
