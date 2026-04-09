@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 import threading
+import re
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -12,6 +13,10 @@ if not os.path.isfile(os.path.join(script_dir,"recipes.json")):
     print("Created file recipes.json")
 
 starttime=round(time.time(),0)
+
+mcpattern = r'§[0-9A-FK-ORa-fk-or]'
+raritypattern = r';[0-9]$'
+rarities=["Common","Uncommon","Rare","Epic","Legendary","Mythic"]
 
 columns, rows = os.get_terminal_size()
 barlenght=columns/3
@@ -58,10 +63,19 @@ def checks(out):
         for i in range(len(grid)-x):
             out[grid[i+x]]=""
     return out
-    
+
+def addname(data):
+    name = re.sub(mcpattern,"",data["displayname"])
+    if re.search(raritypattern,data["internalname"]):
+        ending=data["internalname"].split(";")
+        if "LVL" in name:
+            if ending[1].isdigit():
+                name=rarities[int(ending[1])]+" "+name+" Pet"
+    if name=="Enchanted Book":
+        name=re.sub(r'\b[a-z]', lambda m: m.group().upper(), data["internalname"].removeprefix("ULTIMATE_").replace(";"," ").replace("_"," ").lower())
+    return name.replace("[Lvl {LVL}] ","")
 
 def recipeget(item):
-    clearout=False
     r = requests.get(f"https://raw.githubusercontent.com/NotEnoughUpdates/NotEnoughUpdates-REPO/refs/heads/master/items/{item}.json")
     data = r.json()
     out={}
@@ -73,6 +87,7 @@ def recipeget(item):
         out=checks(out)
     if "level" in out or "result" in out or "drops" in out:
         out={}
+    out["name"]=addname(data)
     return out
 
 def renderbar(num,total,lenght):
@@ -129,6 +144,7 @@ while True:
             f.result()
         break
     except Exception as e:
+        print(e)
         print("Failed, retrying script...")
 
 done=True
