@@ -6,6 +6,11 @@ import time
 import threading
 import re
 
+start = time.time()
+r = requests.get("https://raw.githubusercontent.com/NotEnoughUpdates/NotEnoughUpdates-REPO/refs/heads/master/README.md")
+elapsed = time.time() - start
+print(f"Single request took {elapsed:.2f}s")
+
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 if not os.path.isfile(os.path.join(script_dir,"recipes.json")):
