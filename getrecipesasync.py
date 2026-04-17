@@ -81,7 +81,7 @@ def addname(data):
 async def recipeget(session, item):
     url=f"https://raw.githubusercontent.com/NotEnoughUpdates/NotEnoughUpdates-REPO/refs/heads/master/items/{item}.json"
     async with session.get(url) as r:
-        data = await r.json()
+        data = await r.json(content_type=None)
     out={}
     if "recipe" in data:
         out=data["recipe"]
