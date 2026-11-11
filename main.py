@@ -28,7 +28,7 @@ def filterdata(x):
 def get_price(item,amount):
     return prices[item]*amount
 
-def calculate():
+def calculate(item):
     out=()
     return out
 
@@ -49,4 +49,5 @@ with open(recipefile) as fl:
 with open(pricefile) as fl:
     prices = json.loads(fl.read())
 
-print(get_price("ENCHANTED_REDSTONE",160))
+item="ENCHANTED_DIAMOND"
+print(calculate(item))
