@@ -1,5 +1,7 @@
 #project files
 recipes.json
+recipeshash.txt
+prices.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
