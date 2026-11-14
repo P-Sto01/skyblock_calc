@@ -1,42 +1,288 @@
-import requests
 import json
 import os
-import time
-import subprocess
-import sys
 import re
 import base64
 import gzip
 import io
 import struct
+from decimal import Decimal, InvalidOperation
+import asyncio
+import aiohttp
+from urllib.parse import quote
 
-script_dir=os.path.dirname(os.path.realpath(__file__))
-pricefile = os.path.join(script_dir,"prices.json")
-recipehashfile = os.path.join(script_dir,"recipeshash.txt")
-getrecipes = os.path.join(script_dir,"getrecipesasync.py")
-recipefile = os.path.join(script_dir,"recipes.json")
+# Import helper functions from getrecipesasync (needed for recipe processing)
+try:
+    from getrecipesasync import checks, addname
+except ImportError:
+    # Fallback definitions if the module can't be imported
+    def checks(out):
+        """Process recipe data and extract valid recipes."""
+        result = {"recipes": []}
+        
+        # Skip recipes with level requirements, results, or drops (not standard crafting)
+        if "level" in out or "result" in out or "drops" in out:
+            return result
+        
+        # Handle different recipe types
+        recipe_type = out.get("type")
+        inputs = out.get("inputs", [])
+        
+        if recipe_type and inputs:
+            result["recipes"] = [{
+                "type": recipe_type,
+                "items": inputs,
+                "count": out.get("count", 1),
+                "duration": out.get("duration", 0)
+            }]
+        
+        return result
 
-def get_commit(repo):
-    url = f"https://api.github.com/repos/{repo}/commits"
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.json()[0]["sha"]
+    def addname(data):
+        """Extract item name from NEU data."""
+        return data.get("internalname", "Unknown")
 
-def get_hash(file):
-    with open(file) as fl:
-        return fl.read()
+# In-memory storage for recipes and prices (on-demand fetching)
+_recipes_cache = {}  # item_id -> recipe dict
+_prices_cache = None  # Will be a dict: item_id -> price
 
-def filterbz(x):
-    products = json.loads(x)["products"]
-    return {p["productId"]: p["sellPrice"] for p in [product["quick_status"] for product in products.values()]}
+# Track loaded items to avoid redundant downloads
+_loaded_recipe_items = set()
+_prices_fetched = False
 
-def filterah(x):
-    prod=[]
-    products = json.loads(x)["auctions"]
-    for i in products:
-        if i["bin"] == True:
-            prod.append({get_item_id(i["item_bytes"]): i["starting_bid"]})
-    return prod
+# Configuration
+USE_ON_DEMAND_FETCHING = True  # Set to False to use traditional file-based loading
+
+# ============================================================================
+# ON-DEMAND FETCHING SYSTEM
+# ============================================================================
+
+async def fetch_single_recipe(item_id):
+    """Fetch recipe data for a single item from the NEU API."""
+    # URL-encode the item_id to handle special characters like ; (encoded as %3B)
+    encoded_item_id = quote(item_id, safe='')
+    url = f"https://raw.githubusercontent.com/NotEnoughUpdates/NotEnoughUpdates-REPO/master/items/{encoded_item_id}.json"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return None
+                # Use text() then parse JSON to handle non-JSON content-type headers
+                data = json.loads(await response.text())
+                if "recipe" in data:
+                    out = checks(data["recipe"])
+                elif "recipes" in data:
+                    if data["recipes"]:
+                        out = checks(data["recipes"][0])
+                    else:
+                        out = {"recipes": []}
+                else:
+                    out = {"recipes": []}
+                if "level" in out or "result" in out or "drops" in out:
+                    out = {"recipes": []}
+                out["name"] = addname(data)
+                return {item_id: out}
+    except Exception:
+        return None
+
+def fetch_recipe_on_demand(item_id):
+    """Synchronous wrapper for fetching a single recipe."""
+    if item_id in _loaded_recipe_items:
+        return _recipes_cache.get(item_id)
+    
+    result = asyncio.run(fetch_single_recipe(item_id))
+    if result:
+        _loaded_recipe_items.add(item_id)
+        _recipes_cache.update(result)
+        return result.get(item_id)
+    return None
+
+async def fetch_prices_async():
+    """Fetch all prices from Bazaar and Auction House."""
+    global _prices_cache, _prices_fetched
+    
+    if _prices_fetched:
+        return _prices_cache
+    
+    bazaar_url = "https://api.hypixel.net/v2/skyblock/bazaar"
+    auction_url = "https://api.hypixel.net/v2/skyblock/auctions"
+    
+    prices_dict = {}
+    
+    async with aiohttp.ClientSession() as session:
+        # Fetch bazaar data
+        try:
+            async with session.get(bazaar_url) as response:
+                if response.status == 200:
+                    bazaar_data = await response.json()
+                    for product_id, product in bazaar_data["products"].items():
+                        quick_status = product.get("quick_status")
+                        if quick_status:
+                            prices_dict[product_id] = quick_status["sellPrice"]
+        except Exception as e:
+            print(f"Error fetching bazaar data: {e}")
+        
+        # Fetch auction house data
+        try:
+            async with session.get(auction_url) as response:
+                if response.status == 200:
+                    auction_data = await response.json()
+                    auctions = auction_data.get("auctions", [])
+                    for auction in auctions:
+                        if auction.get("bin"):
+                            item_bytes = auction.get("item_bytes")
+                            starting_bid = auction.get("starting_bid")
+                            if item_bytes and starting_bid is not None:
+                                try:
+                                    item_id = get_item_id(item_bytes)
+                                    if item_id not in prices_dict or starting_bid < prices_dict[item_id]:
+                                        prices_dict[item_id] = starting_bid
+                                except Exception:
+                                    continue
+        except Exception as e:
+            print(f"Error fetching auction data: {e}")
+    
+    _prices_cache = prices_dict
+    _prices_fetched = True
+    return prices_dict
+
+def fetch_prices_on_demand():
+    """Synchronous wrapper for fetching prices."""
+    if _prices_fetched:
+        return _prices_cache
+    
+    return asyncio.run(fetch_prices_async())
+
+def get_recipe(item_id, force_fetch=False):
+    """Get recipe for an item, fetching on-demand if needed."""
+    if USE_ON_DEMAND_FETCHING:
+        if force_fetch or item_id not in _loaded_recipe_items:
+            result = fetch_recipe_on_demand(item_id)
+            return result if result else {"recipes": []}
+        return _recipes_cache.get(item_id, {"recipes": []})
+    else:
+        # Traditional file-based loading
+        with open(recipefile) as fl:
+            all_recipes = json.loads(fl.read())
+        return all_recipes.get(item_id, {"recipes": []})
+
+def get_price(item_id):
+    """Get price for an item, fetching on-demand if needed."""
+    if USE_ON_DEMAND_FETCHING:
+        fetch_prices_on_demand()
+        return _prices_cache.get(item_id)
+    else:
+        with open(pricefile) as fl:
+            all_prices = json.loads(fl.read())
+        return all_prices.get(item_id)
+
+def get_all_recipes():
+    """Get all cached recipes (for on-demand mode, returns only what's been fetched)."""
+    if USE_ON_DEMAND_FETCHING:
+        return _recipes_cache.copy()
+    else:
+        with open(recipefile) as fl:
+            return json.loads(fl.read())
+
+def get_all_prices():
+    """Get all cached prices."""
+    if USE_ON_DEMAND_FETCHING:
+        fetch_prices_on_demand()
+        return _prices_cache.copy() if _prices_cache else {}
+    else:
+        with open(pricefile) as fl:
+            return json.loads(fl.read())
+
+def reset_caches():
+    """Reset all caches for fresh fetching."""
+    global _recipes_cache, _prices_cache, _loaded_recipe_items, _prices_fetched
+    _recipes_cache = {}
+    _prices_cache = None
+    _loaded_recipe_items = set()
+    _prices_fetched = False
+
+
+class PricesProxy:
+    """Proxy object that fetches prices on-demand and provides dict-like access."""
+    
+    def __getitem__(self, key):
+        if USE_ON_DEMAND_FETCHING:
+            fetch_prices_on_demand()
+            return _prices_cache.get(key) if _prices_cache else None
+        else:
+            with open(pricefile) as fl:
+                all_prices = json.loads(fl.read())
+            return all_prices.get(key)
+    
+    def get(self, key, default=None):
+        result = self[key]
+        return result if result is not None else default
+    
+    def __contains__(self, key):
+        if USE_ON_DEMAND_FETCHING:
+            fetch_prices_on_demand()
+            return key in (_prices_cache or {})
+        else:
+            with open(pricefile) as fl:
+                all_prices = json.loads(fl.read())
+            return key in all_prices
+    
+    def keys(self):
+        if USE_ON_DEMAND_FETCHING:
+            fetch_prices_on_demand()
+            return (_prices_cache or {}).keys()
+        else:
+            with open(pricefile) as fl:
+                all_prices = json.loads(fl.read())
+            return all_prices.keys()
+    
+    def values(self):
+        if USE_ON_DEMAND_FETCHING:
+            fetch_prices_on_demand()
+            return (_prices_cache or {}).values()
+        else:
+            with open(pricefile) as fl:
+                all_prices = json.loads(fl.read())
+            return all_prices.values()
+    
+    def items(self):
+        if USE_ON_DEMAND_FETCHING:
+            fetch_prices_on_demand()
+            return (_prices_cache or {}).items()
+        else:
+            with open(pricefile) as fl:
+                all_prices = json.loads(fl.read())
+            return all_prices.items()
+
+
+class RecipesProxy:
+    """Proxy object that fetches recipes on-demand and provides dict-like access."""
+    
+    def __getitem__(self, key):
+        if USE_ON_DEMAND_FETCHING:
+            result = fetch_recipe_on_demand(key)
+            return result if result else {"recipes": []}
+        else:
+            with open(recipefile) as fl:
+                all_recipes = json.loads(fl.read())
+            return all_recipes.get(key, {"recipes": []})
+    
+    def get(self, key, default=None):
+        result = self[key]
+        return result if result is not None else default
+    
+    def __contains__(self, key):
+        if USE_ON_DEMAND_FETCHING:
+            fetch_recipe_on_demand(key)
+            return key in _loaded_recipe_items
+        else:
+            with open(recipefile) as fl:
+                all_recipes = json.loads(fl.read())
+            return key in all_recipes
+
+
+# Global proxy objects used by calculate() and other functions
+prices = PricesProxy()
+recipes = RecipesProxy()
 
 def get_item_id(item_bytes):
     """Parse item_bytes to extract internal item ID using manual NBT parsing."""
@@ -236,15 +482,37 @@ def calculate(item):
                     continue
                 
                 # Get the best option for each ingredient (prune to prevent explosion)
-                # Keep top 3 cheapest overall, but also ensure we keep a buy_direct option if available
+                # Keep more options to explore diverse combinations
                 best_options_per_ingredient = []
-                for ing_options in ingredient_option_lists:
+                for ing_idx, ing_options in enumerate(ingredient_option_lists):
                     sorted_opts = sorted(ing_options, key=lambda x: x[0])
-                    # Take top 2 cheapest
-                    selected = sorted_opts[:2]
-                    # Also include a buy_direct option if available (within top 5)
-                    buy_direct_opts = [o for o in sorted_opts[:5] if 'Buy' in str(o[2])]
-                    selected.extend(buy_direct_opts)
+                    
+                    # Select multiple options to ensure we capture different strategies:
+                    # - Cheapest option
+                    # - Buy direct option (if available)  
+                    # - Second and third cheapest for variety
+                    selected = []
+                    
+                    # Always take the cheapest option
+                    if sorted_opts:
+                        selected.append(sorted_opts[0])
+                    
+                    # Find buy_direct options (where FIRST breakdown line starts with "Buy")
+                    buy_direct_opts = [o for o in sorted_opts if o[2] and o[2][0].startswith("Buy")]
+                    
+                    # Include cheapest buy_direct option if available
+                    if buy_direct_opts:
+                        cheapest_buy = min(buy_direct_opts, key=lambda x: x[0])
+                        if cheapest_buy not in selected:
+                            selected.append(cheapest_buy)
+                    
+                    # Add second and third cheapest if different from what we already have
+                    for i in [1, 2]:
+                        if len(sorted_opts) > i:
+                            opt = sorted_opts[i]
+                            if opt not in selected:
+                                selected.append(opt)
+                    
                     best_options_per_ingredient.append(selected)
                 
                 # Generate combinations only from pruned options
@@ -297,14 +565,18 @@ def calculate(item):
                 item_id = line[4:].strip()  # Extract item after "Buy "
                 shopping_list[item_id] = shopping_list.get(item_id, 0) + 1
         
-        # Use the shopping list tuple as key to ensure unique results
-        key = tuple(sorted(shopping_list.items()))
+        # Use shopping list + method as unique key to avoid duplicate results
+        # This ensures we keep both craft and buy_direct options even if they have similar shopping lists
+        strategy = {}  # Initialize empty - no longer used for uniqueness
+        key = (method, tuple(sorted(shopping_list.items())))
+        
         if key not in unique_results:
             unique_results[key] = {
                 "method": method,
                 "total_price": total_price,
                 "duration": duration,
-                "shopping_list": shopping_list
+                "shopping_list": shopping_list,
+                "strategy": strategy  # Empty dict since we removed strategy extraction
             }
     
     # Get all unique results
@@ -349,51 +621,11 @@ def calculate(item):
     
     return results[:5]
 
-if not os.path.isfile(pricefile) or time.time()-os.path.getmtime(pricefile) > 60:
-    print("Updating prices.json...")
-    bazaar_data = requests.get("https://api.hypixel.net/v2/skyblock/bazaar").json()
-    auction_data = requests.get("https://api.hypixel.net/v2/skyblock/auctions").json()
-    
-    # Filter and merge both sources into one unified dictionary
-    prices_dict = {}
-    
-    # Add bazaar prices
-    for product_id, product in bazaar_data["products"].items():
-        quick_status = product.get("quick_status")
-        if quick_status:
-            prices_dict[product_id] = quick_status["sellPrice"]
-    
-    # Add auction house prices (bin items only)
-    auctions = auction_data.get("auctions", [])
-    for auction in auctions:
-        if auction.get("bin"):
-            item_bytes = auction.get("item_bytes")
-            starting_bid = auction.get("starting_bid")
-            if item_bytes and starting_bid is not None:
-                try:
-                    item_id = get_item_id(item_bytes)
-                    
-                    # Only add if not already in bazaar or if auction price is lower
-                    if item_id not in prices_dict or starting_bid < prices_dict[item_id]:
-                        prices_dict[item_id] = starting_bid
-                except Exception:
-                    continue
-    
-    with open(pricefile, "w") as k:
-        json.dump(prices_dict, k)
-    
-    print("Updating prices.json done!")
-
-if not os.path.isfile(recipehashfile) or get_hash(recipehashfile) != get_commit("NotEnoughUpdates/NotEnoughUpdates-REPO"):
-    print("Updating recipes...")
-    subprocess.run([sys.executable, getrecipes], check=True)
-    print("Updating recipes done!")
-
-with open(recipefile) as fl:
-    recipes = json.loads(fl.read())
-with open(pricefile) as fl:
-    prices = json.loads(fl.read())
-
-item="SHEEP;4"
-for i in calculate(item):
-    print(i)
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+# Demo: Calculate cost for an item
+item = "FINE_AMBER_GEM"
+print(f"\nCalculating best options for: {item}")
+for result in calculate(item):
+    print(result)
