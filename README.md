@@ -8,4 +8,4 @@ Use the `getrecipes.py` or `getrecipesasync.py`(which is faster for me) file to 
 Run `.\visualize_recipes.py --item GHAST_CLOAK --depth 2 --max-nodes 80 --save .\ghast_cloak_graph.png`
 
 # IMPORTANT
-## This project is not yet completed, so everything may be changed!
+## The main branch is mainly for... idk tbh. If interested in using the product, look into other branches!
