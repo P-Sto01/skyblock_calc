@@ -105,14 +105,17 @@ def calculate(item):
         """
         results = []
         
-        # Option 1: Buy directly from bazaar (if available and price > 0)
-        if item_id in prices and prices[item_id] > 0:
-            buy_price = prices[item_id]
+        # Option 1: Buy directly from bazaar (if available)
+        # Note: Use max(1, price) to ensure free items cost at least 1 coin
+        if item_id in prices and prices[item_id] >= 0:
+            buy_price = max(1, prices[item_id])
             results.append((buy_price, 0, [f"Buy {item_id}"]))
         
         # Option 2: Craft from recipes (if available)
         if item_id in recipes:
             item_data = recipes[item_id]
+            # Get count (items produced per craft), default to 1 if missing
+            output_count = item_data.get("count", 1)
             item_recipes = item_data.get("recipes", [])
             
             for recipe in item_recipes:
@@ -123,7 +126,8 @@ def calculate(item):
                 if not ingredients:
                     # Recipe with only coins cost
                     if recipe_coins > 0:
-                        results.append((recipe_coins, recipe_duration, [f"Craft {item_id} (coins only)"]))
+                        # Divide by count since we get multiple items per craft
+                        results.append((recipe_coins / output_count, recipe_duration, [f"Craft {item_id} (coins only)"]))
                     continue
                 
                 # Get options for each ingredient
@@ -149,10 +153,17 @@ def calculate(item):
                         if breakdown:
                             action_line = f"{ing_item_id}x{ing_amount} ({scaled_price/ing_amount if ing_amount > 0 else price:.0f} each): {breakdown[0]}"
                             # Add indented sub-items (skip the summary lines at the end)
+                            # Also multiply quantities in nested items by parent multiplier
                             sub_items = []
                             for line in breakdown:
                                 if not line.startswith("Total "):  # Skip summary lines, they'll be recalculated
-                                    sub_items.append(f"    └─ {line}")
+                                    # Multiply quantities in nested lines by parent amount
+                                    scaled_line = re.sub(
+                                        r'(\w+)x(\d+)', 
+                                        lambda m: f"{m.group(1)}x{int(m.group(2)) * ing_amount}", 
+                                        line
+                                    )
+                                    sub_items.append(f"    └─ {scaled_line}")
                             scaled_breakdown = [action_line] + sub_items
                         else:
                             scaled_breakdown = [f"{ing_item_id}x{ing_amount}: Get directly"]
@@ -167,40 +178,33 @@ def calculate(item):
                 if not valid_recipe or not ingredient_option_lists:
                     continue
                 
-                # Get the best option for each ingredient (prune to prevent explosion)
-                # Keep top 3 cheapest overall, but also ensure we keep a buy_direct option if available
-                best_options_per_ingredient = []
-                for ing_options in ingredient_option_lists:
-                    sorted_opts = sorted(ing_options, key=lambda x: x[0])
-                    # Take top 2 cheapest
-                    selected = sorted_opts[:2]
-                    # Also include a buy_direct option if available (within top 5)
-                    buy_direct_opts = [o for o in sorted_opts[:5] if 'Buy' in str(o[2])]
-                    selected.extend(buy_direct_opts)
-                    best_options_per_ingredient.append(selected)
-                
-                # Generate combinations only from pruned options
+                # Generate combinations from ALL options (no pruning)
                 from itertools import product
                 
                 recipe_results = []
-                for combo in product(*best_options_per_ingredient):
+                for combo in product(*ingredient_option_lists):
                     total_price = sum(opt[0] for opt in combo) + recipe_coins
                     max_duration = max(opt[1] for opt in combo) + recipe_duration
                     
-                    if total_price == 0:
+                    # Divide by output_count since we get multiple items per craft
+                    # This gives us the cost PER item
+                    total_price_per_item = total_price / output_count
+                    
+                    if total_price_per_item == 0:
                         continue
                     
                     # Build detailed breakdown with costs
-                    breakdown = [f"Craft {item_id} (Recipe coins: ${recipe_coins:.2f})"]
-                    total_ingredients_cost = 0
+                    breakdown = [f"Craft {item_id} (x{output_count}, Recipe coins: ${recipe_coins:.2f})"]
+                    total_ingredients_cost = sum(opt[0] for opt in combo)
+                    
                     for ing_str, (price, dur, ing_breakdown) in zip(ingredients, combo):
                         breakdown.extend(ing_breakdown)
-                        total_ingredients_cost += price
                     
                     breakdown.append(f"Total ingredients: ${total_ingredients_cost:.2f}")
-                    breakdown.append(f"Total cost: ${total_price:.2f}")
+                    breakdown.append(f"Total cost (for {output_count} items): ${total_price:.2f}")
+                    breakdown.append(f"Cost per item: ${total_price_per_item:.2f}")
                     
-                    recipe_results.append((total_price, max_duration, breakdown))
+                    recipe_results.append((total_price_per_item, max_duration, breakdown))
                 
                 # Keep all results from this recipe (will be deduplicated later)
                 results.extend(recipe_results)
@@ -216,18 +220,111 @@ def calculate(item):
         method = "craft" if len(breakdown) > 1 or breakdown[0].startswith("Craft") else "buy_direct"
         
         # Extract shopping list from breakdown (only base "Buy" items)
+        # Quantities are already multiplied through the tree structure, but we need to
+        # account for craft output counts (e.g., Craft BLAZE_POWDER x2 means divide children by 2)
         shopping_list = {}
-        for line in breakdown:
-            # Handle ingredient format: "ITEMx123 (price each): Buy ITEM"
-            buy_match = re.search(r'(\w+)x(\d+).*?:\s*Buy\s+(\w+)', line)
-            if buy_match:
-                item_id = buy_match.group(3)  # Use the captured "Buy ITEM" part
-                quantity = int(buy_match.group(2))
-                shopping_list[item_id] = shopping_list.get(item_id, 0) + quantity
-            # Handle top-level direct purchase format: "Buy ITEM"
-            elif line.startswith("Buy "):
-                item_id = line[4:].strip()  # Extract item after "Buy "
-                shopping_list[item_id] = shopping_list.get(item_id, 0) + 1
+        
+        def extract_shopping_list(lines):
+            # Build a map of which items use which ingredients
+            item_ingredients = {}  # item -> set of ingredient_ids it uses
+            item_quantities = {}   # item -> total quantity needed
+            
+            # Track current craft hierarchy using stack
+            # Each entry: (item_id, base_indent_level)
+            craft_stack = []
+            
+            for line in lines:
+                # Skip empty lines and cost-only lines
+                if not line.strip() or 'Cost per item' in line or 'Total' in line:
+                    continue
+                
+                # Calculate indent level by counting "└─" prefixes
+                indent_level = line.count('└─')
+                
+                # Match pattern: ITEMxQUANTITY ...: Craft ITEM
+                # Example: NULL_OVOIDx32 (59269 each): Craft NULL_OVOID (x1, Recipe coins: $0.00)
+                # Use [^:\s]+ to match item IDs that may contain semicolons (e.g., SHEEP;4)
+                craft_match = re.search(r'([^:\s]+)x(\d+).*?:\s*Craft\s+([^\s]+)', line)
+                if craft_match:
+                    item_id = craft_match.group(1)
+                    quantity = int(craft_match.group(2))
+                    
+                    # Pop stack until we find a parent (lower indent)
+                    while craft_stack and craft_stack[-1][1] >= indent_level:
+                        craft_stack.pop()
+                    
+                    # If there's a parent on the stack, add this item as its ingredient
+                    if craft_stack:
+                        parent_craft = craft_stack[-1][0]
+                        if parent_craft not in item_ingredients:
+                            item_ingredients[parent_craft] = set()
+                        item_ingredients[parent_craft].add(item_id)
+                    
+                    # Add this craft to stack with its indent level
+                    craft_stack.append((item_id, indent_level))
+                    
+                    if item_id not in item_ingredients:
+                        item_ingredients[item_id] = set()
+                    item_quantities[item_id] = quantity
+                
+                # Match pattern: ITEMxQUANTITY ...: Buy ITEM (base ingredient)
+                # Use [^:\s]+ to match item IDs that may contain semicolons (e.g., SHEEP;4)
+                buy_match = re.search(r'([^:\s]+)x(\d+).*?:\s*Buy\s+([^\s]+)', line)
+                if buy_match:
+                    item_id = buy_match.group(1)
+                    quantity = int(buy_match.group(2))
+                    
+                    # Add to current craft's ingredients (if any)
+                    if craft_stack:
+                        parent_craft = craft_stack[-1][0]
+                        if parent_craft not in item_ingredients:
+                            item_ingredients[parent_craft] = set()
+                        item_ingredients[parent_craft].add(item_id)
+                    
+                    item_quantities[item_id] = quantity
+                
+                # Handle simple "Buy ITEM" case (direct purchase, no quantity pattern)
+                # Use [^\s]+ to match item IDs that may contain semicolons (e.g., SHEEP;4)
+                simple_buy_match = re.search(r'^Buy\s+([^\s]+)$', line.strip())
+                if simple_buy_match:
+                    item_id = simple_buy_match.group(1)
+                    item_quantities[item_id] = 1
+
+            # Find leaf items (items that don't have ingredients listed)
+            leaves = {}
+            
+            def collect_leaves(item_id, visited=None):
+                if visited is None:
+                    visited = set()
+                
+                if item_id in visited:
+                    return
+                visited.add(item_id)
+                
+                # Get ingredients for this item
+                ingredients = item_ingredients.get(item_id, set())
+                
+                if ingredients:
+                    # Recursively collect leaves from ingredients
+                    for ingredient in ingredients:
+                        collect_leaves(ingredient, visited)
+                else:
+                    # This is a leaf - add it with its quantity
+                    leaves[item_id] = item_quantities.get(item_id, 0)
+            
+            # Find root items (items not used as ingredients by any other item)
+            all_ingredients = set()
+            for ingredients in item_ingredients.values():
+                all_ingredients.update(ingredients)
+            
+            root_items = set(item_quantities.keys()) - all_ingredients
+            
+            for root_item in root_items:
+                collect_leaves(root_item)
+            
+            return leaves
+        
+        shopping_list = extract_shopping_list(breakdown)
         
         # Use the shopping list tuple as key to ensure unique results
         key = tuple(sorted(shopping_list.items()))
@@ -357,5 +454,6 @@ with open(pricefile) as fl:
     prices = json.loads(fl.read())
 
 item="SHEEP;4"
+
 for i in calculate(item):
     print(i)

@@ -39,12 +39,13 @@ def get_commit(repo):
 
 
 def checks(out):
+    # Always set count, defaulting to 1 if not present
     if not "count" in out:
-        out["count"]=1
+        out["count"] = 1
     if not "duration" in out:
-        out["duration"]=0
+        out["duration"] = 0
     if not "coins" in out:
-        out["coins"]=0
+        out["coins"] = 0
     if "overrideOutputId" in out:
         del out["overrideOutputId"]
     if "type" in out:
@@ -52,9 +53,9 @@ def checks(out):
     if "supercraftable" in out:
         del out["supercraftable"]
     if "time" in out:
-        out["duration"]=out["time"]
+        out["duration"] = out["time"]
         del out["time"]
-    ingredients=[]
+    ingredients = []
     if "inputs" in out:
         ingredients.extend(out.pop("inputs"))
     if "items" in out:
@@ -62,26 +63,26 @@ def checks(out):
         del out["output"]
     for slot in grid:
         if slot in out:
-            ingredient=out.pop(slot)
+            ingredient = out.pop(slot)
             if ingredient:
                 ingredients.append(ingredient)
-    item_counts={}
+    item_counts = {}
     for ingredient in ingredients:
         if ingredient:
-            item, separator, count=ingredient.rpartition(":")
+            item, separator, count = ingredient.rpartition(":")
             if not separator:
-                item, count=ingredient, "1"
+                item, count = ingredient, "1"
             try:
-                amount=Decimal(count)
+                amount = Decimal(count)
             except InvalidOperation as e:
                 raise ValueError(f"Invalid recipe ingredient count: {ingredient}") from e
             if not amount.is_finite():
                 raise ValueError(f"Invalid recipe ingredient count: {ingredient}")
-            item_counts[item]=item_counts.get(item, Decimal(0))+amount
-    out["recipes"]=[{
-        "items":[f"{item}:{format(count.normalize(), 'f')}" for item, count in item_counts.items()],
-        "coins":out.pop("coins"),
-        "duration":out.pop("duration")
+            item_counts[item] = item_counts.get(item, Decimal(0)) + amount
+    out["recipes"] = [{
+        "items": [f"{item}:{format(count.normalize(), 'f')}" for item, count in item_counts.items()],
+        "coins": out.pop("coins"),
+        "duration": out.pop("duration")
     }]
     return out
 
@@ -110,11 +111,14 @@ async def recipeget(session, item):
             out=data["recipes"][0]
             out=checks(out)
         else:
-            out["recipes"]=[]
+            # Empty recipes array - set default count
+            out={"count": 1, "recipes": []}
     else:
-        out["recipes"]=[]
+        # No recipe field at all - set default count
+        out={"count": 1, "recipes": []}
     if "level" in out or "result" in out or "drops" in out:
-        out={"recipes":[]}
+        # Invalid recipe type - reset with count
+        out={"count": 1, "recipes": []}
     out["name"]=addname(data)
     return out
 
